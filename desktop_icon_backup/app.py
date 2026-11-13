@@ -78,7 +78,9 @@ class DesktopIconBackupApp:
             if isinstance(manifest_data, dict)
             else []
         )
-        registry_layout.import_layout(entry["reg_files"], backup_dir)
+        registry_layout.import_layout(
+            entry["reg_files"], backup_dir, expected_hash=entry.get("payload_hash")
+        )
         self.store.mark_used(entry_id)
 
         current_items = desktop_manifest.enumerate_desktop_items()
