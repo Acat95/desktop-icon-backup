@@ -236,6 +236,48 @@ class RestoreTests(unittest.TestCase):
             registry_layout.import_layout(self.reg_files, self.backup_dir)
         self.assertEqual(self.registry.calls, [])
 
+    def test_malicious_export_lines_are_rejected_even_with_matching_hash(self):
+        source = self.backup_dir / "desktop_3.reg"
+        original = source.read_text(encoding="utf-16")
+        extra_lines = [
+            r"[-HKEY_CURRENT_USER\Software\Unrelated]",
+            f"[HKEY_CURRENT_USER\\{DESKTOP3}] [HKEY_CURRENT_USER\\Software\\Unrelated]",
+            "\x00[HKEY_CURRENT_USER\\Software\\Unrelated]",
+            " \r[HKEY_CURRENT_USER\\Software\\Unrelated]",
+            '"Value"=hex:00,\\\n[HKEY_CURRENT_USER\\Software\\Unrelated]',
+        ]
+        for extra in extra_lines:
+            with self.subTest(extra=extra):
+                # Bytes preserve crafted line endings on Windows.
+                source.write_bytes((original + extra + "\n").encode("utf-16"))
+                self.digest = registry_layout.payload_hash(self.backup_dir, self.reg_files)
+                self.work_dir.mkdir(exist_ok=True)
+                with self.assertRaises(RegistryOperationError):
+                    self.restore()
+        self.assertEqual(self.registry.calls, [])
+
+    def test_paths_outside_snapshot_are_rejected_before_access(self):
+        source = self.backup_dir / "desktop_3.reg"
+        for name in (str(source), "..\\desktop_3.reg", "desktop_3.reg:payload.reg"):
+            with self.subTest(name=name):
+                self.reg_files[-1]["file"] = name
+                self.work_dir.mkdir(exist_ok=True)
+                with self.assertRaisesRegex(RegistryOperationError, "文件名无效"):
+                    self.restore()
+        self.assertEqual(self.registry.calls, [])
+
+    def test_registry_value_types_used_by_export_are_accepted(self):
+        path = self.backup_dir / "desktop_3.reg"
+        with path.open("a", encoding="utf-16-le") as fh:
+            fh.write(
+                '\n"IconLayouts"=hex:01,02,\\\n  03,00\n'
+                '"Mode"=dword:00000001\n'
+                '"Monitor"=hex(b):01,00,00,00,00,00,00,00\n'
+                f"\n[HKEY_CURRENT_USER\\{DESKTOP3}\\Subkey]\n"
+                '@="value with escaped \\"quotes\\" and \\\\slash"\n'
+            )
+        registry_layout._validate_reg_file(path.read_bytes(), DESKTOP3, path.name)
+
     def test_snapshot_failure_leaves_registry_untouched(self):
         self.registry.fail_export = True
         with self.assertRaises(RegistryOperationError):

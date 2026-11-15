@@ -1,3 +1,4 @@
+import json
 import shutil
 import tempfile
 import unittest
@@ -46,6 +47,83 @@ class BackupStoreTests(unittest.TestCase):
         entries = self.store.list_entries()
         self.assertEqual(len(entries), 5)
         self.assertFalse(any(e["created_at"].startswith("2026-01-01T00:00:00") for e in entries))
+
+    def test_failed_index_replace_preserves_every_old_backup(self):
+        self.store.max_backups = 1
+        payload, exports = self._payload("first", b"first")
+        _, old, _ = self.store.create_backup(payload, exports, [], "manual")
+        old_directory = self.base / old["dir"]
+        index = self.base / "index.json"
+        original_index = index.read_bytes()
+        payload, exports = self._payload("second", b"second")
+        with mock.patch("desktop_icon_backup.json_io.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.store.create_backup(payload, exports, [], "manual")
+        self.assertEqual(index.read_bytes(), original_index)
+        self.assertEqual(list(self.base.glob("backup_*")), [old_directory])
+        self.assertEqual((old_directory / "desktop_1.reg").read_bytes(), b"first")
+
+    def test_failed_eviction_cleanup_is_retried_after_reopening_store(self):
+        self.store.max_backups = 1
+        times = ["2026-01-01T00:00:01+08:00", "2026-01-01T00:00:02+08:00"]
+        with mock.patch("desktop_icon_backup.backup_store.now_iso", side_effect=times):
+            payload, exports = self._payload("first", b"first")
+            _, old, _ = self.store.create_backup(payload, exports, [], "manual")
+            payload, exports = self._payload("second", b"second")
+            with mock.patch.object(self.store, "_remove_dir", side_effect=PermissionError("locked")):
+                with self.assertLogs("desktop_icon_backup.backup_store", level="WARNING"):
+                    _, new, _ = self.store.create_backup(payload, exports, [], "manual")
+
+        reopened = BackupStore(self.base, max_backups=1)
+        self.assertEqual([item["id"] for item in reopened.list_entries()], [new["id"]])
+        self.assertTrue((self.base / old["dir"]).exists())
+        payload, exports = self._payload("retry", b"second")
+        _, _, outcome = reopened.create_backup(payload, exports, [], "manual")
+        self.assertEqual(outcome, "skip")
+        self.assertFalse((self.base / old["dir"]).exists())
+        self.assertTrue((self.base / new["dir"]).is_dir())
+
+    def test_failed_manual_delete_preserves_backup_directory(self):
+        payload, exports = self._payload("first", b"first")
+        _, entry, _ = self.store.create_backup(payload, exports, [], "manual")
+        with mock.patch.object(self.store, "_save_index", side_effect=PermissionError("locked")):
+            with self.assertRaises(PermissionError):
+                self.store.delete_entry(entry["id"])
+        self.assertFalse(self.store.list_entries()[0]["broken"])
+
+    def test_tampered_restore_directory_and_missing_hash_are_broken(self):
+        payload, exports = self._payload("first", b"first")
+        _, entry, _ = self.store.create_backup(payload, exports, [], "manual")
+        index = self.base / "index.json"
+        cases = [
+            ({**entry, "dir": str(self.base / entry["dir"])}, "目录名无效"),
+            ({**entry, "dir": "..\\" + entry["dir"]}, "目录名无效"),
+            ({**entry, "payload_hash": None}, "校验值缺失或无效"),
+        ]
+        for item, reason in cases:
+            with self.subTest(reason=reason, path=item["dir"]):
+                index.write_text(json.dumps({"backups": [item]}), encoding="utf-8")
+                self.assertIn(reason, self.store.list_entries()[0]["broken_reason"])
+
+    def test_directory_redirect_cannot_be_restored_or_removed(self):
+        payload, exports = self._payload("first", b"first")
+        _, entry, _ = self.store.create_backup(payload, exports, [], "manual")
+        target = self.base.resolve() / entry["dir"]
+        external = self.base.parent.resolve() / "outside"
+        external.mkdir()
+        original_resolve = Path.resolve
+
+        def resolve(path, *args, **kwargs):
+            if path == target:
+                return external
+            return original_resolve(path, *args, **kwargs)
+
+        with mock.patch.object(type(target), "resolve", resolve):
+            self.assertTrue(self.store.list_entries()[0]["broken"])
+            with self.assertLogs("desktop_icon_backup.backup_store", level="WARNING"):
+                self.store.delete_entry(entry["id"])
+        self.assertTrue(external.is_dir())
+        self.assertTrue(target.is_dir())
 
     def test_duplicate_payload_is_skipped(self):
         payload1, exports1 = self._payload("payload_1", b"same")

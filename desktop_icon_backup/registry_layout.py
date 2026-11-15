@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import codecs
 import hashlib
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -13,6 +15,15 @@ import winreg
 from .config import BAGS_BASE_KEY
 
 logger = logging.getLogger(__name__)
+
+_REG_NAME = re.compile(r"desktop_[1-9][0-9]*\.reg", re.IGNORECASE | re.ASCII)
+_REG_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\ufeff\u2028\u2029]")
+_REG_SECTION = re.compile(r"\[([^\[\]]+)\]")
+_REG_STRING = r'"(?:[^"\\]|\\["\\])*"'
+_REG_VALUE = re.compile(
+    rf"(?:{_REG_STRING}|@)=({_REG_STRING}|dword:[0-9a-fA-F]{{8}}|hex(?:\([0-9a-fA-F]+\))?:.*)"
+)
+_REG_HEX = re.compile(r"(?:(?:[0-9a-fA-F]{2},)*[0-9a-fA-F]{2}(?:,\\)?)?")
 
 
 class LayoutNotReady(Exception):
@@ -137,26 +148,62 @@ def _import_file(source: Path) -> None:
         )
 
 
+def backup_reg_file(backup_dir: Path, file_name: str) -> Path:
+    if not isinstance(file_name, str) or not _REG_NAME.fullmatch(file_name):
+        raise RegistryOperationError(f"备份注册表文件名无效: {file_name}")
+    path = backup_dir / file_name
+    if path.resolve() != path or not path.is_file():
+        raise RegistryOperationError(f"备份注册表文件缺失或路径无效: {file_name}")
+    return path
+
+
 def _validate_reg_file(data: bytes, bag_path: str, file_name: str) -> None:
     try:
         # reg.exe export on supported Windows versions writes UTF-16 with a BOM.
-        lines = data.decode("utf-16").split("\n")
+        if not data.startswith(codecs.BOM_UTF16_LE):
+            raise UnicodeError("missing UTF-16 LE BOM")
+        content = data.decode("utf-16").replace("\r\n", "\n")
     except UnicodeError as exc:
         raise RegistryOperationError(f"备份注册表文件编码无效: {file_name}") from exc
-    if lines[0].rstrip("\r") != "Windows Registry Editor Version 5.00":
+    lines = content.split("\n")
+    if lines[0] != "Windows Registry Editor Version 5.00":
         raise RegistryOperationError(f"备份注册表文件头无效: {file_name}")
-    root = f"HKEY_CURRENT_USER\\{bag_path}".casefold()
+    if _REG_CONTROL.search(content):
+        raise RegistryOperationError(f"备份注册表文件包含无效的控制字符: {file_name}")
+
+    root = f"HKEY_CURRENT_USER\\{bag_path}"
+    allowed_key = re.compile(
+        re.escape(root) + r"(?:\\[^\\\t]+)*", re.IGNORECASE | re.ASCII
+    )
     has_root = False
+    continued = False
     for line in lines[1:]:
-        section = line.strip()
-        if not section.startswith("["):
+        line = line.strip(" \t")
+        if continued:
+            if not line or not _REG_HEX.fullmatch(line):
+                raise RegistryOperationError(f"备份注册表文件的续行无效: {file_name}")
+            continued = line.endswith("\\")
             continue
-        key = section[1:-1].casefold()
-        if not section.endswith("]") or (key != root and not key.startswith(root + "\\")):
-            raise RegistryOperationError(f"备份注册表文件包含无效的键: {file_name}")
-        has_root |= key == root
-    if not has_root:
-        raise RegistryOperationError(f"备份注册表文件缺少目标桌面键: {file_name}")
+        if not line:
+            continue
+        if line.startswith("["):
+            section = _REG_SECTION.fullmatch(line)
+            if not section or not allowed_key.fullmatch(section[1]):
+                raise RegistryOperationError(f"备份注册表文件包含无效的键: {file_name}")
+            has_root |= section[1].isascii() and section[1].lower() == root.lower()
+            if not has_root:
+                raise RegistryOperationError(f"备份注册表文件缺少目标桌面键: {file_name}")
+            continue
+        value = _REG_VALUE.fullmatch(line)
+        if not has_root or not value:
+            raise RegistryOperationError(f"备份注册表文件包含无效的数据: {file_name}")
+        if value[1].startswith("hex"):
+            hex_data = value[1].split(":", 1)[1]
+            if not _REG_HEX.fullmatch(hex_data):
+                raise RegistryOperationError(f"备份注册表文件包含无效的十六进制数据: {file_name}")
+            continued = hex_data.endswith("\\")
+    if not has_root or continued:
+        raise RegistryOperationError(f"备份注册表文件不完整: {file_name}")
 
 
 def _stage_restore_files(
@@ -175,22 +222,19 @@ def _stage_restore_files(
         normalized_key = bag_path.casefold()
         key_parts = normalized_key.removeprefix(bag_prefix).split("\\")
         if (
-            not normalized_key.startswith(bag_prefix)
+            not bag_path.isascii()
+            or not normalized_key.startswith(bag_prefix)
             or len(key_parts) < 2
             or not all(key_parts)
+            or _REG_CONTROL.search(bag_path)
+            or any(char in bag_path for char in '/[]"\t\n')
             or key_parts[-1] != "desktop"
             or "desktop" in key_parts[:-1]
+            or any(part in {".", ".."} for part in key_parts)
             or normalized_key in seen_keys
         ):
             raise RegistryOperationError(f"备份中的桌面布局键无效或重复: {bag_path}")
-        if (
-            Path(file_name).name != file_name
-            or Path(file_name).suffix.lower() != ".reg"
-        ):
-            raise RegistryOperationError(f"备份注册表文件名无效: {file_name}")
-        source = backup_dir / file_name
-        if source.resolve().parent != backup_dir or not source.is_file():
-            raise RegistryOperationError(f"备份注册表文件缺失或路径无效: {file_name}")
+        source = backup_reg_file(backup_dir, file_name)
         data = source.read_bytes()
         _validate_reg_file(data, bag_path, file_name)
         staged_file = staged_dir / file_name

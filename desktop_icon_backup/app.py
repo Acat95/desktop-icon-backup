@@ -71,15 +71,15 @@ class DesktopIconBackupApp:
             raise FileNotFoundError("备份不存在")
         if entry.get("broken"):
             raise RuntimeError("该备份已损坏，无法恢复")
-        backup_dir = self.data_dir / entry["dir"]
-        manifest_data = read_json(backup_dir / "manifest.json", {"items": []})
+        manifest_path = self.store.manifest_file(entry["dir"])
+        manifest_data = read_json(manifest_path, {"items": []})
         manifest_items = (
             manifest_data.get("items", [])
             if isinstance(manifest_data, dict)
             else []
         )
         registry_layout.import_layout(
-            entry["reg_files"], backup_dir, expected_hash=entry.get("payload_hash")
+            entry["reg_files"], manifest_path.parent, expected_hash=entry["payload_hash"]
         )
         self.store.mark_used(entry_id)
 
