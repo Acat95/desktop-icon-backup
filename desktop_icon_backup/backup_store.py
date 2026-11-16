@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import MAX_BACKUPS
+from .desktop_layout import Layout, decode_layout
 from .json_io import now_iso, read_json_strict, write_json_atomic
 from .registry_layout import backup_reg_file, payload_hash
 
@@ -56,10 +58,19 @@ class BackupStore:
         return target
 
     def manifest_file(self, dir_name: str) -> Path:
-        path = self.backup_directory(dir_name) / "manifest.json"
+        return self._backup_file(dir_name, "manifest.json")
+
+    def _backup_file(self, dir_name: str, file_name: str) -> Path:
+        path = self.backup_directory(dir_name) / file_name
         if path.resolve() != path or not path.is_file():
-            raise FileNotFoundError("清单文件缺失或路径无效")
+            raise FileNotFoundError(f"备份文件缺失或路径无效: {file_name}")
         return path
+
+    def read_desktop_layout(self, entry: Dict[str, Any]) -> Layout:
+        data = self._backup_file(entry["dir"], "layout.json").read_bytes()
+        if hashlib.sha256(data).hexdigest() != entry["payload_hash"]:
+            raise ValueError("桌面坐标备份校验失败")
+        return decode_layout(json.loads(data))
 
     def list_entries(self) -> List[Dict[str, Any]]:
         with self._index_lock:
@@ -77,13 +88,16 @@ class BackupStore:
                 digest = item.get("payload_hash")
                 if not isinstance(digest, str) or not _PAYLOAD_HASH.fullmatch(digest):
                     raise ValueError("备份校验值缺失或无效")
-                reg_files = item.get("reg_files") or []
-                if not isinstance(reg_files, list) or not reg_files:
-                    raise FileNotFoundError("注册表文件信息缺失")
-                for reg_info in reg_files:
-                    if not isinstance(reg_info, dict) or "file" not in reg_info:
-                        raise FileNotFoundError("注册表文件信息不完整")
-                    backup_reg_file(entry_dir, reg_info["file"])
+                if item.get("layout_format") == "shell":
+                    self._backup_file(item["dir"], "layout.json")
+                else:
+                    reg_files = item.get("reg_files") or []
+                    if not isinstance(reg_files, list) or not reg_files:
+                        raise FileNotFoundError("注册表文件信息缺失")
+                    for reg_info in reg_files:
+                        if not isinstance(reg_info, dict) or "file" not in reg_info:
+                            raise FileNotFoundError("注册表文件信息不完整")
+                        backup_reg_file(entry_dir, reg_info["file"])
             except Exception as exc:
                 item["broken"] = True
                 item["broken_reason"] = str(exc)
@@ -96,9 +110,16 @@ class BackupStore:
         exports: List[Dict[str, str]],
         manifest: List[Dict[str, str]],
         source: str,
+        *,
+        layout: Dict[str, Any] | None = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
         payload_dir = Path(payload_dir)
-        digest = payload_hash(payload_dir, exports)
+        if layout is None:
+            digest = payload_hash(payload_dir, exports)
+        else:
+            layout_file = payload_dir / "layout.json"
+            write_json_atomic(layout_file, layout)
+            digest = hashlib.sha256(layout_file.read_bytes()).hexdigest()
         with self._index_lock:
             index = self._load_index()
             entries = index["backups"]
@@ -123,6 +144,8 @@ class BackupStore:
                 "payload_hash": digest,
                 "reg_files": exports,
             }
+            if layout is not None:
+                entry["layout_format"] = "shell"
             entries.append(entry)
             evicted_dirs = []
             while len(entries) > self.max_backups:

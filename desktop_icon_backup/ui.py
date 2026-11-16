@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import queue
-import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -17,6 +16,7 @@ class AppUI:
     def __init__(self, app):
         self.app = app
         self._command_queue: "queue.Queue" = queue.Queue()
+        self._operation_pending = False
         self.entries = {}
         self.root = tk.Tk()
         self.root.title(config.APP_NAME)
@@ -98,7 +98,7 @@ class AppUI:
         self.auto_backup_check.pack(side="left", padx=(0, 12))
         self.restart_check = ttk.Checkbutton(
             frame,
-            text="恢复后自动重启资源管理器",
+            text="恢复旧版备份时重启资源管理器",
             variable=self.restart_var,
             command=self._on_setting_changed,
         )
@@ -185,8 +185,8 @@ class AppUI:
     def run_backup(self) -> None:
         if self._busy():
             return
-        self.status_var.set("正在备份...")
         self._run_worker(
+            "正在备份...",
             lambda: self.app.perform_backup("manual"),
             self._backup_done,
             self._error,
@@ -217,27 +217,30 @@ class AppUI:
             )
             return
         warn = ""
-        if self.app.settings.restart_explorer_on_restore:
+        if entry.get("layout_format") != "shell" and self.app.settings.restart_explorer_on_restore:
             warn = "\n恢复后会重启资源管理器，当前打开的资源管理器窗口会关闭。"
         if not messagebox.askyesno(
             config.APP_NAME,
             f"确定恢复到 {entry.get('created_at', '')} 的备份吗？{warn}",
         ):
             return
-        self.status_var.set("正在恢复...")
         self._run_worker(
+            "正在恢复...",
             lambda: self.app.perform_restore(entry["id"]),
             self._restore_done,
             self._error,
         )
 
     def _restore_done(self, message: str) -> None:
-        self.status_var.set("恢复完成")
+        status = message.splitlines()[0]
+        self.status_var.set(status)
         self.append_result(message)
         self.refresh()
-        self.app.notify(message.splitlines()[0])
+        self.app.notify(status)
 
     def delete_selected(self) -> None:
+        if self._busy():
+            return
         selection = self._tree.selection()
         if not selection:
             return
@@ -249,33 +252,31 @@ class AppUI:
             "确定删除这份备份吗？此操作不可撤销。",
         ):
             return
-        try:
-            self.app.store.delete_entry(entry["id"])
-            message = f"已删除备份 {entry.get('created_at', '')}"
-            self.status_var.set(message)
-            self.append_result(message)
-            self.refresh()
-        except Exception as exc:
-            logger.exception("删除备份失败")
-            self._error(exc)
+        self._run_worker(
+            "正在删除备份...",
+            lambda: self.app.store.delete_entry(entry["id"]),
+            lambda _result: self._store_changed(f"已删除备份 {entry.get('created_at', '')}"),
+            self._error,
+        )
 
     def clear_all(self) -> None:
-        if not self.entries:
+        if self._busy() or not self.entries:
             return
         if not messagebox.askyesno(
             config.APP_NAME,
             "确定清空全部备份吗？此操作不可撤销。",
         ):
             return
-        try:
-            count = self.app.store.clear_all()
-            message = f"已清空 {count} 份备份"
-            self.status_var.set(message)
-            self.append_result(message)
-            self.refresh()
-        except Exception as exc:
-            logger.exception("清空备份失败")
-            self._error(exc)
+        self._run_worker(
+            "正在清空备份...",
+            self.app.store.clear_all,
+            lambda count: self._store_changed(f"已清空 {count} 份备份"),
+            self._error,
+        )
+
+    def _store_changed(self, message: str) -> None:
+        self._simple_done(message)
+        self.refresh()
 
     def restart_explorer_click(self) -> None:
         if self._busy():
@@ -285,8 +286,8 @@ class AppUI:
             "重启资源管理器会关闭当前打开的文件资源管理器窗口，继续吗？",
         ):
             return
-        self.status_var.set("正在重启资源管理器...")
         self._run_worker(
+            "正在重启资源管理器...",
             restart_explorer,
             lambda: self._simple_done("资源管理器已重启"),
             self._error,
@@ -313,21 +314,29 @@ class AppUI:
         self.append_result(message)
 
     def _busy(self) -> bool:
-        if self.status_var.get().startswith("正在"):
+        if self._operation_pending:
             messagebox.showinfo(config.APP_NAME, "当前有任务正在执行，请稍候。")
             return True
         return False
 
-    def _run_worker(self, fn, done, failed) -> None:
-        def target() -> None:
+    def _run_worker(self, status, fn, done, failed) -> None:
+        if self._busy():
+            return
+        self._operation_pending = True
+        self.status_var.set(status)
+
+        def complete(future):
+            self._operation_pending = False
             try:
-                result = fn()
-                self.root.after(0, done, result)
+                result = future.result()
             except Exception as exc:
                 logger.exception("后台任务失败")
-                self.root.after(0, failed, exc)
+                failed(exc)
+            else:
+                done(result)
 
-        threading.Thread(target=target, daemon=True).start()
+        future = self.app.submit_operation(fn)
+        future.add_done_callback(lambda finished: self.post_command(lambda: complete(finished)))
 
     def _error(self, exc) -> None:
         message = str(exc) or exc.__class__.__name__

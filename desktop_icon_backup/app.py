@@ -8,9 +8,11 @@ import shutil
 import sys
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 
-from . import __version__, autostart, config, desktop_manifest, explorer, registry_layout
+from . import __version__, autostart, config, desktop_layout, desktop_manifest, explorer, registry_layout
 from .backup_store import BackupStore
 from .json_io import read_json
 from .logging_setup import init_logging
@@ -25,6 +27,7 @@ class DesktopIconBackupApp:
         self.settings = config.Settings.load()
         self.store = BackupStore(self.data_dir)
         self.exit_event = threading.Event()
+        self._operations = ThreadPoolExecutor(max_workers=1, thread_name_prefix="desktop")
         self._tray = None
         self._ui = None
         self._mutex = None
@@ -43,18 +46,25 @@ class DesktopIconBackupApp:
         parent = self.data_dir.parent
         return parent.exists() and os.access(parent, os.W_OK)
 
+    def submit_operation(self, operation):
+        return self._operations.submit(operation)
+
+    def shutdown_operations(self) -> None:
+        self._operations.shutdown(wait=True, cancel_futures=True)
+
     def perform_backup(self, source: str):
         payload_dir = Path(
             tempfile.mkdtemp(prefix=".tmp_backup_", dir=str(self.data_dir))
         )
         try:
-            exports = registry_layout.export_layout(payload_dir)
-            manifest = desktop_manifest.enumerate_desktop_items()
+            layout = desktop_layout.capture()
+            manifest = [{"name": icon.name, "path": icon.key} for icon in layout.icons]
             created, _entry, outcome = self.store.create_backup(
                 payload_dir,
-                exports,
+                [],
                 manifest,
                 source,
+                layout={"version": 1, **asdict(layout)},
             )
             payload_dir = None
             if outcome == "skip":
@@ -71,6 +81,21 @@ class DesktopIconBackupApp:
             raise FileNotFoundError("备份不存在")
         if entry.get("broken"):
             raise RuntimeError("该备份已损坏，无法恢复")
+        if entry.get("layout_format") == "shell":
+            result = desktop_layout.restore(self.store.read_desktop_layout(entry))
+            self.store.mark_used(entry_id)
+            if result.different or result.missing or not result.settings_match:
+                summary = f"布局未完全匹配，已确认 {result.matched} 个图标坐标"
+            else:
+                summary = f"已验证 {result.matched} 个图标坐标和桌面排列设置"
+            if result.different:
+                summary += _describe_items("坐标与备份不同", result.different)
+            if result.missing:
+                summary += _describe_items("桌面中缺失", result.missing)
+            if not result.settings_match:
+                summary += "\n当前排列设置与备份不同。"
+            return summary
+
         manifest_path = self.store.manifest_file(entry["dir"])
         manifest_data = read_json(manifest_path, {"items": []})
         manifest_items = (
@@ -85,23 +110,18 @@ class DesktopIconBackupApp:
 
         current_items = desktop_manifest.enumerate_desktop_items()
         missing = desktop_manifest.missing_names(manifest_items, current_items)
-        summary = f"已恢复备份 {entry.get('created_at', '')}"
+        summary = "已导入旧版布局，图标坐标尚未验证"
         if missing:
-            shown = "、".join(missing[:20])
-            suffix = " 等" if len(missing) > 20 else ""
-            summary += (
-                f"\n以下 {len(missing)} 个图标因源文件缺失，恢复后不会显示，"
-                f"请手动补全：\n{shown}{suffix}"
-            )
+            summary += _describe_items("桌面中缺失", missing)
         if self.settings.restart_explorer_on_restore:
             try:
                 explorer.restart_explorer()
-                summary += "\n资源管理器已重启，图标布局已生效。"
+                summary += "\n资源管理器已重启，请检查实际布局。"
             except Exception as exc:
                 logger.exception("重启资源管理器失败")
                 summary += f"\n注册表已恢复，但资源管理器重启失败：{exc}"
         else:
-            summary += "\n未自动重启资源管理器，请手动重启使其生效。"
+            summary += "\n请手动重启资源管理器并检查实际布局。"
         return summary
 
     def request_exit(self) -> None:
@@ -112,22 +132,37 @@ class DesktopIconBackupApp:
             self._ui.root.after(0, self._ui.root.destroy)
 
 
+def _describe_items(label, names) -> str:
+    shown = "、".join(names[:20])
+    suffix = " 等" if len(names) > 20 else ""
+    return f"\n{label}的图标（{len(names)} 个）：{shown}{suffix}"
+
+
 def _boot_backup_worker(app: DesktopIconBackupApp) -> None:
     logger.info("等待桌面就绪后执行开机自动备份")
     ready = explorer.wait_desktop_ready()
     if not ready:
         logger.warning("桌面未在限定时间内就绪，本次跳过自动备份")
         return
-    try:
-        created, message = app.perform_backup("auto")
-        logger.info("开机自动备份结果: %s", message)
-        if created:
-            app.notify(message)
-    except registry_layout.LayoutNotReady as exc:
-        logger.info("跳过开机自动备份: %s", exc)
-    except Exception:
-        logger.exception("开机自动备份失败")
-        app.notify("开机自动备份失败，详见日志")
+    def backup():
+        if app.exit_event.is_set() or not app.settings.auto_backup_enabled:
+            return
+        try:
+            created, message = app.perform_backup("auto")
+            logger.info("开机自动备份结果: %s", message)
+            if created:
+                app._ui.post_command(app._ui.refresh)
+                app.notify(message)
+        except Exception:
+            logger.exception("开机自动备份失败")
+            app.notify("开机自动备份失败，详见日志")
+
+    if not app.exit_event.is_set():
+        try:
+            app.submit_operation(backup)
+        except RuntimeError:
+            if not app.exit_event.is_set():
+                raise
 
 
 def _make_tray_menu(app: DesktopIconBackupApp):
@@ -167,8 +202,11 @@ def run_checks() -> int:
     except Exception:
         report.append(("Pillow", "不可用", False))
     report.append(("reg.exe", "可用" if shutil.which("reg.exe") else "不可用", bool(shutil.which("reg.exe"))))
-    keys = registry_layout.find_desktop_bag_keys()
-    report.append(("桌面布局键", f"找到 {len(keys)} 个", len(keys) > 0))
+    try:
+        layout = desktop_layout.capture()
+        report.append(("桌面视图", f"读取到 {len(layout.icons)} 个图标坐标", True))
+    except (OSError, RuntimeError) as exc:
+        report.append(("桌面视图", str(exc), False))
     data_dir = config.data_dir()
     writable = not data_dir.exists() or os.access(data_dir, os.W_OK)
     report.append(("数据目录", str(data_dir), writable))
@@ -210,14 +248,6 @@ def main(argv=None) -> int:
                 autostart.set_enabled(True)
             except Exception:
                 logger.exception("修复开机自启项失败")
-        if args.autostart and app.settings.auto_backup_enabled:
-            threading.Thread(
-                target=_boot_backup_worker,
-                args=(app,),
-                daemon=True,
-                name="boot-backup",
-            ).start()
-
         from .tray import TrayController
         from .ui import AppUI
 
@@ -228,11 +258,20 @@ def main(argv=None) -> int:
             app._tray.set_error(True)
             app._ui.set_storage_error(True)
             app.notify("存储目录不可写，备份/恢复已禁用")
+        elif args.autostart and app.settings.auto_backup_enabled:
+            threading.Thread(
+                target=_boot_backup_worker,
+                args=(app,),
+                daemon=True,
+                name="boot-backup",
+            ).start()
         app._ui.start()
     except Exception:
         logger.exception("程序启动失败")
         return 1
     finally:
+        app.exit_event.set()
+        app.shutdown_operations()
         release(mutex)
     return 0
 
