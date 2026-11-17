@@ -5,6 +5,7 @@ import unittest
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
+from queue import Queue
 from unittest.mock import Mock, patch
 
 from desktop_icon_backup import desktop_layout
@@ -57,6 +58,42 @@ class DesktopOperationsTests(unittest.TestCase):
 
         self.assertEqual(order, ["manual", "auto", "clear"])
         self.app._ui.post_command.assert_called_once_with(self.app._ui.refresh)
+
+    def test_tray_exit_keeps_ui_alive_until_running_restore_finishes(self):
+        started = threading.Event()
+        finish = threading.Event()
+        callbacks = Queue()
+        self.app._ui = Mock()
+        self.app._ui.post_command.side_effect = callbacks.put
+        self.app._tray = Mock()
+
+        def restore():
+            started.set()
+            if not finish.wait(5):
+                raise TimeoutError("test restore was not released")
+            return "restore complete"
+
+        restoring = self.app.submit_operation(restore)
+        pending = Mock()
+        waiting = self.app.submit_operation(pending)
+        try:
+            self.assertTrue(started.wait(5))
+            self.app.request_exit()
+            self.app.request_exit()
+            self.app._ui.begin_exit.assert_called_once_with()
+            self.app._tray.stop.assert_not_called()
+            self.app._ui.root.after.assert_not_called()
+            self.assertTrue(callbacks.empty())
+            self.assertTrue(waiting.cancelled())
+            with self.assertRaisesRegex(RuntimeError, "正在退出"):
+                self.app.submit_operation(Mock())
+        finally:
+            finish.set()
+        self.assertEqual(restoring.result(timeout=5), "restore complete")
+        callbacks.get(timeout=5)()
+        self.app._tray.stop.assert_called_once_with()
+        self.app._ui.root.after.assert_called_once_with(0, self.app._ui.root.destroy)
+        pending.assert_not_called()
 
     def test_coordinate_backup_and_restore_use_live_layout(self):
         moved = Layout(VIEW, (Icon(ICON.key, ICON.name, 60, 50),))
