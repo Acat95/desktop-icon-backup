@@ -49,7 +49,6 @@ def log_path() -> Path:
 
 @dataclass
 class Settings:
-    autostart_enabled: bool = True
     auto_backup_enabled: bool = True
     restart_explorer_on_restore: bool = True
 
@@ -59,7 +58,6 @@ class Settings:
         if not isinstance(data, dict):
             data = {}
         return cls(
-            autostart_enabled=bool(data.get("autostart_enabled", True)),
             auto_backup_enabled=bool(data.get("auto_backup_enabled", True)),
             restart_explorer_on_restore=bool(data.get("restart_explorer_on_restore", True)),
         )
@@ -67,7 +65,6 @@ class Settings:
     def save(self) -> None:
         data_dir().mkdir(parents=True, exist_ok=True)
         write_json_atomic(settings_path(), {
-            "autostart_enabled": self.autostart_enabled,
             "auto_backup_enabled": self.auto_backup_enabled,
             "restart_explorer_on_restore": self.restart_explorer_on_restore,
         })

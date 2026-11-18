@@ -4,6 +4,7 @@ import logging
 import os
 import queue
 import tkinter as tk
+from concurrent.futures import CancelledError
 from tkinter import messagebox, ttk
 
 from . import config
@@ -17,6 +18,7 @@ class AppUI:
         self.app = app
         self._command_queue: "queue.Queue" = queue.Queue()
         self._operation_pending = False
+        self._storage_error = False
         self.entries = {}
         self.root = tk.Tk()
         self.root.title(config.APP_NAME)
@@ -79,14 +81,14 @@ class AppUI:
     def _build_settings(self) -> None:
         frame = ttk.LabelFrame(self.root, text="设置")
         frame.pack(fill="x", padx=10, pady=6)
-        self.autostart_var = tk.IntVar(value=1)
+        self.autostart_var = tk.IntVar(value=0)
         self.auto_backup_var = tk.IntVar(value=1)
         self.restart_var = tk.IntVar(value=1)
         self.autostart_check = ttk.Checkbutton(
             frame,
             text="开机自启",
             variable=self.autostart_var,
-            command=self._on_setting_changed,
+            command=self._on_autostart_changed,
         )
         self.autostart_check.pack(side="left", padx=(8, 12))
         self.auto_backup_check = ttk.Checkbutton(
@@ -150,37 +152,54 @@ class AppUI:
 
     def _set_setting_display(self) -> None:
         settings = self.app.settings
-        self.autostart_var.set(int(settings.autostart_enabled))
         self.auto_backup_var.set(int(settings.auto_backup_enabled))
         self.restart_var.set(int(settings.restart_explorer_on_restore))
         self.data_dir_var.set(str(self.app.data_dir))
+        self._update_controls()
 
-    def set_storage_error(self, enabled: bool) -> None:
-        state = "disabled" if enabled else "normal"
+    def _update_controls(self) -> None:
+        state = "disabled" if self._storage_error or self.app.exit_event.is_set() else "normal"
         for button in self._action_buttons.values():
             button.configure(state=state)
-        for check in (
-            self.autostart_check,
-            self.auto_backup_check,
-            self.restart_check,
-        ):
+        for check in (self.auto_backup_check, self.restart_check):
             check.configure(state=state)
+        autostart = self.app.autostart_enabled
+        self.autostart_var.set(int(autostart is True))
+        self.autostart_check.configure(
+            state="disabled" if autostart is None else state,
+            text="开机自启（无法读取）" if autostart is None else "开机自启",
+        )
+
+    def set_storage_error(self, enabled: bool) -> None:
+        self._storage_error = enabled
+        self._update_controls()
         if enabled:
             self.status_var.set("存储目录不可写，备份/恢复已禁用")
             self.append_result("存储目录不可写，请检查程序目录权限后重试。")
 
     def _on_setting_changed(self) -> None:
-        self.app.settings = config.Settings(
-            autostart_enabled=bool(self.autostart_var.get()),
+        settings = config.Settings(
             auto_backup_enabled=bool(self.auto_backup_var.get()),
             restart_explorer_on_restore=bool(self.restart_var.get()),
         )
         try:
-            self.app.persist_settings()
+            self.app.persist_settings(settings)
             self.status_var.set("设置已保存")
         except Exception as exc:
             logger.exception("保存设置失败")
+            self._set_setting_display()
             self._error(exc)
+
+    def _on_autostart_changed(self) -> None:
+        try:
+            self.app.set_autostart(bool(self.autostart_var.get()))
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.exception("更改 Windows 自启设置失败")
+            self._update_controls()
+            self._error(exc)
+            return
+        self._update_controls()
+        self.status_var.set("开机自启已开启" if self.app.autostart_enabled else "开机自启已关闭")
 
     def run_backup(self) -> None:
         if self._busy():
@@ -298,7 +317,9 @@ class AppUI:
         os.startfile(str(self.app.data_dir))
 
     def show_window(self) -> None:
-        self.refresh()
+        if not self.app.exit_event.is_set():
+            self.app.refresh_autostart()
+            self.refresh()
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -309,11 +330,17 @@ class AppUI:
     def exit_app(self) -> None:
         self.app.request_exit()
 
+    def begin_exit(self) -> None:
+        self._update_controls()
+        self.status_var.set("正在等待当前操作结束，完成后将退出…")
+
     def _simple_done(self, message: str) -> None:
         self.status_var.set(message)
         self.append_result(message)
 
     def _busy(self) -> bool:
+        if self.app.exit_event.is_set():
+            return True
         if self._operation_pending:
             messagebox.showinfo(config.APP_NAME, "当前有任务正在执行，请稍候。")
             return True
@@ -329,6 +356,8 @@ class AppUI:
             self._operation_pending = False
             try:
                 result = future.result()
+            except CancelledError:
+                return
             except Exception as exc:
                 logger.exception("后台任务失败")
                 failed(exc)

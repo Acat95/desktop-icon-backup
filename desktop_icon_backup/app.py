@@ -8,7 +8,7 @@ import shutil
 import sys
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
@@ -25,16 +25,33 @@ class DesktopIconBackupApp:
     def __init__(self, data_dir: Path | None = None):
         self.data_dir = Path(data_dir or config.data_dir())
         self.settings = config.Settings.load()
+        self.refresh_autostart()
         self.store = BackupStore(self.data_dir)
         self.exit_event = threading.Event()
+        self._operation_lock = threading.Lock()
         self._operations = ThreadPoolExecutor(max_workers=1, thread_name_prefix="desktop")
         self._tray = None
         self._ui = None
         self._mutex = None
 
-    def persist_settings(self) -> None:
-        self.settings.save()
-        autostart.set_enabled(self.settings.autostart_enabled)
+    def refresh_autostart(self) -> None:
+        try:
+            self.autostart_enabled = autostart.is_enabled()
+        except OSError:
+            logger.exception("无法读取 Windows 自启状态")
+            self.autostart_enabled = None
+
+    def set_autostart(self, enabled: bool) -> None:
+        try:
+            autostart.set_enabled(enabled)
+        finally:
+            self.refresh_autostart()
+        if self.autostart_enabled is not enabled:
+            raise RuntimeError("无法确认 Windows 自启设置已生效")
+
+    def persist_settings(self, settings: config.Settings) -> None:
+        settings.save()
+        self.settings = settings
 
     def notify(self, message: str, title: str = config.APP_NAME) -> None:
         if self._tray is not None:
@@ -47,7 +64,15 @@ class DesktopIconBackupApp:
         return parent.exists() and os.access(parent, os.W_OK)
 
     def submit_operation(self, operation):
-        return self._operations.submit(operation)
+        def run():
+            if self.exit_event.is_set():
+                raise CancelledError()
+            return operation()
+
+        with self._operation_lock:
+            if self.exit_event.is_set():
+                raise RuntimeError("程序正在退出")
+            return self._operations.submit(run)
 
     def shutdown_operations(self) -> None:
         self._operations.shutdown(wait=True, cancel_futures=True)
@@ -125,7 +150,25 @@ class DesktopIconBackupApp:
         return summary
 
     def request_exit(self) -> None:
-        self.exit_event.set()
+        with self._operation_lock:
+            if self.exit_event.is_set():
+                return
+            self.exit_event.set()
+        self._operations.shutdown(wait=False, cancel_futures=True)
+        if self._ui is None:
+            self._wait_for_exit()
+            return
+        self._ui.begin_exit()
+        threading.Thread(target=self._wait_for_exit, name="wait-for-exit", daemon=True).start()
+
+    def _wait_for_exit(self) -> None:
+        self.shutdown_operations()
+        if self._ui is not None:
+            self._ui.post_command(self._finish_exit)
+        else:
+            self._finish_exit()
+
+    def _finish_exit(self) -> None:
         if self._tray is not None:
             self._tray.stop()
         if self._ui is not None:
@@ -243,11 +286,6 @@ def main(argv=None) -> int:
     app = DesktopIconBackupApp()
     app._mutex = mutex
     try:
-        if args.autostart and app.settings.autostart_enabled:
-            try:
-                autostart.set_enabled(True)
-            except Exception:
-                logger.exception("修复开机自启项失败")
         from .tray import TrayController
         from .ui import AppUI
 
