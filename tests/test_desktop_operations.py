@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from desktop_icon_backup import desktop_layout
 from desktop_icon_backup.app import DesktopIconBackupApp, _boot_backup_worker
+from desktop_icon_backup.config import BAGS_BASE_KEY
 from desktop_icon_backup.desktop_layout import Icon, Layout, ViewSettings
 
 
@@ -121,15 +122,19 @@ class DesktopOperationsTests(unittest.TestCase):
         path = self.app.data_dir / entry["dir"] / "layout.json"
         path.write_text("{}", encoding="utf-8")
         with patch.object(desktop_layout, "restore") as restore:
-            with self.assertRaisesRegex(ValueError, "校验失败"):
+            with self.assertRaisesRegex(RuntimeError, "备份已损坏"):
                 self.app.perform_restore(entry["id"])
         restore.assert_not_called()
 
     def test_registry_only_backup_is_restored_with_unverified_status(self):
         payload = self.app.data_dir / "staged"
         payload.mkdir()
-        (payload / "desktop_1.reg").write_bytes(b"legacy payload")
-        exports = [{"file": "desktop_1.reg", "bag_path": "desktop"}]
+        bag_path = BAGS_BASE_KEY + r"\1\Desktop"
+        (payload / "desktop_1.reg").write_text(
+            f"Windows Registry Editor Version 5.00\n\n[HKEY_CURRENT_USER\\{bag_path}]\n",
+            encoding="utf-16",
+        )
+        exports = [{"file": "desktop_1.reg", "bag_path": bag_path}]
         _, entry, _ = self.app.store.create_backup(payload, exports, [], "manual")
         self.app.settings.restart_explorer_on_restore = True
         with patch("desktop_icon_backup.app.registry_layout.import_layout") as importer, \
@@ -139,6 +144,19 @@ class DesktopOperationsTests(unittest.TestCase):
         importer.assert_called_once()
         restart.assert_called_once()
         self.assertIn("图标坐标尚未验证", message)
+
+    def test_missing_index_recovers_an_older_coordinate_backup(self):
+        with patch.object(desktop_layout, "capture", return_value=LAYOUT):
+            self.app.perform_backup("manual")
+        entry, = self.app.store.list_entries()
+        manifest = self.app.store.manifest_file(entry["dir"])
+        data = json.loads(manifest.read_bytes())
+        del data["backup"]
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+        (self.app.data_dir / "index.json").unlink()
+        recovered, = self.app.store.list_entries()
+        self.assertFalse(recovered["broken"])
+        self.assertEqual(self.app.store.read_desktop_layout(recovered), LAYOUT)
 
 
 class DesktopLayoutTests(unittest.TestCase):

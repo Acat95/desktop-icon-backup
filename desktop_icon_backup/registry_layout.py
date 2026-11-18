@@ -157,7 +157,7 @@ def backup_reg_file(backup_dir: Path, file_name: str) -> Path:
     return path
 
 
-def _validate_reg_file(data: bytes, bag_path: str, file_name: str) -> None:
+def _reg_lines(data: bytes, file_name: str) -> list[str]:
     try:
         # reg.exe export on supported Windows versions writes UTF-16 with a BOM.
         if not data.startswith(codecs.BOM_UTF16_LE):
@@ -170,14 +170,17 @@ def _validate_reg_file(data: bytes, bag_path: str, file_name: str) -> None:
         raise RegistryOperationError(f"备份注册表文件头无效: {file_name}")
     if _REG_CONTROL.search(content):
         raise RegistryOperationError(f"备份注册表文件包含无效的控制字符: {file_name}")
+    return lines[1:]
 
+
+def _validate_reg_file(data: bytes, bag_path: str, file_name: str) -> None:
     root = f"HKEY_CURRENT_USER\\{bag_path}"
     allowed_key = re.compile(
         re.escape(root) + r"(?:\\[^\\\t]+)*", re.IGNORECASE | re.ASCII
     )
     has_root = False
     continued = False
-    for line in lines[1:]:
+    for line in _reg_lines(data, file_name):
         line = line.strip(" \t")
         if continued:
             if not line or not _REG_HEX.fullmatch(line):
@@ -206,11 +209,11 @@ def _validate_reg_file(data: bytes, bag_path: str, file_name: str) -> None:
         raise RegistryOperationError(f"备份注册表文件不完整: {file_name}")
 
 
-def _stage_restore_files(
-    reg_files: List[Dict[str, str]], backup_dir: Path, staged_dir: Path
-) -> Dict[str, Path]:
-    targets = {}
+def _validated_reg_files(reg_files: List[Dict[str, str]], backup_dir: Path):
+    if not isinstance(reg_files, list) or not reg_files:
+        raise RegistryOperationError("备份中没有桌面布局键")
     seen_keys = set()
+    seen_files = set()
     bag_prefix = BAGS_BASE_KEY.casefold() + "\\"
     for item in reg_files:
         if not isinstance(item, dict):
@@ -219,6 +222,8 @@ def _stage_restore_files(
         bag_path = item.get("bag_path")
         if not isinstance(file_name, str) or not isinstance(bag_path, str):
             raise RegistryOperationError("备份中的注册表文件信息不完整")
+        if file_name.lower() in seen_files:
+            raise RegistryOperationError(f"备份中的注册表文件重复: {file_name}")
         normalized_key = bag_path.casefold()
         key_parts = normalized_key.removeprefix(bag_prefix).split("\\")
         if (
@@ -237,14 +242,39 @@ def _stage_restore_files(
         source = backup_reg_file(backup_dir, file_name)
         data = source.read_bytes()
         _validate_reg_file(data, bag_path, file_name)
+        seen_keys.add(normalized_key)
+        seen_files.add(file_name.lower())
+        yield bag_path, file_name, data
+
+
+def _stage_restore_files(
+    reg_files: List[Dict[str, str]], backup_dir: Path, staged_dir: Path
+) -> Dict[str, Path]:
+    targets = {}
+    for bag_path, file_name, data in _validated_reg_files(reg_files, backup_dir):
         staged_file = staged_dir / file_name
         with staged_file.open("xb") as fh:
             fh.write(data)
-        seen_keys.add(normalized_key)
         targets[bag_path] = staged_file
-    if not targets:
-        raise RegistryOperationError("备份中没有桌面布局键")
     return targets
+
+
+def validated_payload_hash(backup_dir: Path, reg_files: List[Dict[str, str]]) -> str:
+    files = sorted(_validated_reg_files(reg_files, backup_dir))
+    return _hash_file_bytes(data for _, _, data in files)
+
+
+def recover_export_index(backup_dir: Path) -> List[Dict[str, str]]:
+    exports = []
+    root = "HKEY_CURRENT_USER\\"
+    for path in sorted(backup_dir.glob("desktop_*.reg")):
+        source = backup_reg_file(backup_dir, path.name)
+        lines = _reg_lines(source.read_bytes(), path.name)
+        section = _REG_SECTION.fullmatch(next((line.strip() for line in lines if line.strip()), ""))
+        if not section or not section[1].lower().startswith(root.lower()):
+            raise RegistryOperationError(f"无法识别备份的桌面布局键: {path.name}")
+        exports.append({"file": path.name, "bag_path": section[1][len(root):]})
+    return exports
 
 
 def import_layout(
@@ -304,9 +334,15 @@ def import_layout(
 
 
 def payload_hash(payload_dir: Path, exports: List[Dict[str, str]]) -> str:
+    return _hash_file_bytes(
+        (Path(payload_dir) / item["file"]).read_bytes()
+        for item in sorted(exports, key=lambda e: e.get("bag_path", ""))
+    )
+
+
+def _hash_file_bytes(files) -> str:
     sha = hashlib.sha256()
-    for item in sorted(exports, key=lambda e: e.get("bag_path", "")):
-        data = (Path(payload_dir) / item["file"]).read_bytes()
+    for data in files:
         sha.update(len(data).to_bytes(8, "little"))
         sha.update(data)
     return sha.hexdigest()

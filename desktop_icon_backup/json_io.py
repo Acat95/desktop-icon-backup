@@ -28,17 +28,17 @@ def read_json(path: Path, default: Any) -> Any:
 def read_json_strict(path: Path, default: Any) -> Any:
     """Read JSON, or quarantine a corrupt file and return the default."""
     try:
-        if not path.exists():
-            return default
         with path.open("r", encoding="utf-8") as fh:
             return json.load(fh)
-    except Exception:
+    except FileNotFoundError:
+        return default
+    except (json.JSONDecodeError, UnicodeError, RecursionError):
         logger.exception("JSON 损坏，隔离文件 %s", path)
         try:
-            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
             dest = path.with_name(f"{path.stem}.corrupt-{stamp}.json")
             os.replace(str(path), str(dest))
-        except Exception:
+        except OSError:
             logger.exception("隔离损坏的 JSON 失败 %s", path)
         return default
 

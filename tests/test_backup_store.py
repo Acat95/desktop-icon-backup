@@ -6,6 +6,10 @@ from pathlib import Path
 from unittest import mock
 
 from desktop_icon_backup.backup_store import BackupStore
+from desktop_icon_backup.config import BAGS_BASE_KEY
+
+
+_BAG_PATH = BAGS_BASE_KEY + r"\1\Desktop"
 
 
 class BackupStoreTests(unittest.TestCase):
@@ -21,10 +25,16 @@ class BackupStoreTests(unittest.TestCase):
     def _payload(self, name, content):
         payload = self.base / name
         payload.mkdir()
-        (payload / "desktop_1.reg").write_bytes(content)
+        (payload / "desktop_1.reg").write_bytes(
+            (
+                "Windows Registry Editor Version 5.00\r\n\r\n"
+                f"[HKEY_CURRENT_USER\\{_BAG_PATH}]\r\n"
+                f'"Layout"="{content.decode("ascii")}"\r\n'
+            ).encode("utf-16")
+        )
         exports = [
             {
-                "bag_path": "Software\\Microsoft\\Windows\\Shell\\Bags\\1\\Desktop",
+                "bag_path": _BAG_PATH,
                 "file": "desktop_1.reg",
             }
         ]
@@ -61,7 +71,7 @@ class BackupStoreTests(unittest.TestCase):
                 self.store.create_backup(payload, exports, [], "manual")
         self.assertEqual(index.read_bytes(), original_index)
         self.assertEqual(list(self.base.glob("backup_*")), [old_directory])
-        self.assertEqual((old_directory / "desktop_1.reg").read_bytes(), b"first")
+        self.assertIn('"Layout"="first"', (old_directory / "desktop_1.reg").read_text("utf-16"))
 
     def test_failed_eviction_cleanup_is_retried_after_reopening_store(self):
         self.store.max_backups = 1
@@ -140,6 +150,95 @@ class BackupStoreTests(unittest.TestCase):
         self.assertEqual(outcome2, "skip")
         self.assertFalse(payload2.exists())
         self.assertEqual(len(self.store.list_entries()), count_after_first)
+
+    def test_dedup_does_not_skip_when_latest_backup_is_damaged(self):
+        for index, damage in enumerate(("desktop_1.reg", "manifest.json", None)):
+            with self.subTest(damage=damage):
+                store = BackupStore(self.base / f"case_{index}")
+                payload, exports = self._payload(f"payload_{index}", b"same")
+                created, entry, _ = store.create_backup(payload, exports, [], "manual")
+                self.assertTrue(created)
+                directory = self.base / f"case_{index}" / entry["dir"]
+                if damage == "desktop_1.reg":
+                    # Keep valid registry syntax but change the original bytes.
+                    source = directory / damage
+                    source.write_bytes(source.read_bytes().replace(
+                        "same".encode("utf-16-le"), "edit".encode("utf-16-le")
+                    ))
+                elif damage == "manifest.json":
+                    (directory / damage).write_text('{"items":[null]}', encoding="utf-8")
+                else:
+                    shutil.rmtree(directory)
+                self.assertTrue(store.list_entries()[0]["broken"])
+                payload, exports = self._payload(f"replacement_{index}", b"same")
+                with self.assertLogs("desktop_icon_backup.backup_store", level="WARNING"):
+                    self.assertTrue(store.create_backup(payload, exports, [], "manual")[0])
+
+    def test_equal_payload_with_changed_manifest_is_saved(self):
+        payload, exports = self._payload("first", b"same")
+        self.store.create_backup(payload, exports, [{"name": "App", "path": "old"}], "manual")
+        payload, exports = self._payload("second", b"same")
+        self.assertTrue(self.store.create_backup(
+            payload, exports, [{"name": "App", "path": "new"}], "manual"
+        )[0])
+
+    def test_corrupt_index_is_rebuilt_from_saved_metadata(self):
+        payload, exports = self._payload("first", b"first")
+        _, entry, _ = self.store.create_backup(payload, exports, [{"name": "App"}], "auto")
+        with mock.patch("desktop_icon_backup.backup_store.now_iso", return_value="2027-01-01T00:00:00+08:00"):
+            marked = self.store.mark_used(entry["id"])
+        index = self.base / "index.json"
+        index.write_bytes(b'{"backups":')
+        with self.assertLogs("desktop_icon_backup.json_io", level="ERROR"):
+            rebuilt = self.store.list_entries()
+        self.assertEqual(
+            rebuilt, [{**marked, "broken": False, "broken_reason": ""}]
+        )
+        self.assertEqual(json.loads(index.read_bytes())["backups"], [marked])
+        self.assertEqual(len(list(self.base.glob("index.corrupt-*.json"))), 1)
+
+    def test_partial_index_preserves_valid_entries_and_excludes_pending_cleanup(self):
+        entries = []
+        for index in range(3):
+            payload, exports = self._payload(f"payload_{index}", str(index).encode("ascii"))
+            _, entry, _ = self.store.create_backup(payload, exports, [], "manual")
+            entries.append(entry)
+        good, missing, pending = entries
+        index = self.base / "index.json"
+        index.write_text(json.dumps({
+            "backups": [None, {"dir": missing["dir"]}, good, good],
+            "pending_cleanup": [pending["dir"]],
+        }), encoding="utf-8")
+        recovered = self.store.list_entries()
+        self.assertEqual({item["id"] for item in recovered}, {good["id"], missing["id"]})
+        self.assertTrue(all(not item["broken"] for item in recovered))
+        saved = json.loads(index.read_bytes())
+        self.assertEqual(saved["pending_cleanup"], [pending["dir"]])
+
+    def test_missing_index_recovers_legacy_registry_snapshot(self):
+        payload, exports = self._payload("first", b"first")
+        _, entry, _ = self.store.create_backup(payload, exports, [], "manual")
+        manifest = self.store.manifest_file(entry["dir"])
+        manifest.write_text('{"items":[]}', encoding="utf-8")
+        (self.base / "index.json").unlink()
+        rebuilt, = self.store.list_entries()
+        self.assertFalse(rebuilt["broken"])
+        self.assertEqual(rebuilt["dir"], entry["dir"])
+        self.assertEqual(rebuilt["reg_files"], exports)
+        self.assertEqual(rebuilt["payload_hash"], entry["payload_hash"])
+
+    def test_missing_index_does_not_restore_backup_committed_for_deletion(self):
+        payload, exports = self._payload("first", b"first")
+        _, entry, _ = self.store.create_backup(payload, exports, [], "manual")
+        with mock.patch.object(self.store, "_remove_dir", side_effect=PermissionError("locked")):
+            with self.assertLogs("desktop_icon_backup.backup_store", level="WARNING"):
+                self.store.delete_entry(entry["id"])
+        index = self.base / "index.json"
+        index.unlink()
+
+        self.assertEqual(self.store.list_entries(), [])
+        self.assertTrue((self.base / entry["dir"]).is_dir())
+        self.assertEqual(json.loads(index.read_bytes())["pending_cleanup"], [entry["dir"]])
 
     def test_mark_used_refreshes_last_used_at(self):
         stamps = ["2026-02-01T00:00:00+08:00", "2026-02-01T00:00:01+08:00"]

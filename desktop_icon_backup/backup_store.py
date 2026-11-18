@@ -14,11 +14,29 @@ from typing import Any, Dict, List, Optional, Tuple
 from .config import MAX_BACKUPS
 from .desktop_layout import Layout, decode_layout
 from .json_io import now_iso, read_json_strict, write_json_atomic
-from .registry_layout import backup_reg_file, payload_hash
+from .registry_layout import (
+    RegistryOperationError,
+    payload_hash,
+    recover_export_index,
+    validated_payload_hash,
+)
 
 logger = logging.getLogger(__name__)
 _BACKUP_DIR_NAME = re.compile(r"backup_[0-9]{8}_[0-9]{6}_[0-9a-f]{6}", re.IGNORECASE | re.ASCII)
+_BACKUP_ID = re.compile(r"[0-9a-f]{32}")
 _PAYLOAD_HASH = re.compile(r"[0-9a-f]{64}")
+_BACKUP_ERRORS = (OSError, ValueError, RecursionError, RegistryOperationError)
+
+
+def _index_entry_valid(entry: Any) -> bool:
+    return (
+        isinstance(entry, dict)
+        and all(
+            isinstance(entry.get(field), str) and entry[field]
+            for field in ("id", "dir", "created_at", "last_used_at")
+        )
+        and _BACKUP_ID.fullmatch(entry["id"]) is not None
+    )
 
 
 class BackupStore:
@@ -34,11 +52,93 @@ class BackupStore:
         return self._base / "index.json"
 
     def _load_index(self) -> Dict[str, Any]:
-        index = read_json_strict(self._index_path(), {"backups": []})
-        if not isinstance(index, dict) or not isinstance(index.get("backups"), list):
-            logger.warning("index.json 结构异常，重置索引")
-            index = {"backups": []}
+        original = read_json_strict(self._index_path(), None)
+        index = original if isinstance(original, dict) else {}
+        records = index.get("backups")
+        entries = []
+        known_dirs = set()
+        known_ids = set()
+        if isinstance(records, list):
+            for entry in records:
+                if not _index_entry_valid(entry):
+                    continue
+                name = entry["dir"].lower()
+                if name in known_dirs or entry["id"] in known_ids:
+                    continue
+                entries.append(entry)
+                known_dirs.add(name)
+                known_ids.add(entry["id"])
+            if len(entries) == len(records):
+                return index
+
+        pending = index.get("pending_cleanup")
+        pending = (
+            [name for name in pending if isinstance(name, str) and _BACKUP_DIR_NAME.fullmatch(name)]
+            if isinstance(pending, list) else []
+        )
+        # Keep committed deletions out of a rebuilt index even if cleanup failed.
+        for marker in self._base.glob(".backup_*.deleted"):
+            name = marker.name[1:-len(".deleted")]
+            if _BACKUP_DIR_NAME.fullmatch(name) and name not in pending:
+                pending.append(name)
+        known_dirs.update(name.lower() for name in pending)
+        for directory in sorted(self._base.iterdir()):
+            if not _BACKUP_DIR_NAME.fullmatch(directory.name) or directory.name.lower() in known_dirs:
+                continue
+            try:
+                entry = self._recover_entry(directory.name)
+            except _BACKUP_ERRORS as exc:
+                logger.warning("跳过无法重建索引的备份 %s: %s", directory.name, exc)
+                continue
+            if entry["id"] in known_ids:
+                logger.warning("跳过标识重复的备份目录: %s", directory.name)
+                continue
+            entries.append(entry)
+            known_ids.add(entry["id"])
+        index["backups"] = entries
+        if pending:
+            index["pending_cleanup"] = pending
+        if original is not None or entries or pending:
+            try:
+                self._save_index(index)
+            except OSError:
+                logger.exception("无法保存重建的备份索引")
+            else:
+                logger.info("已重建备份索引，收录 %d 份备份", len(entries))
         return index
+
+    def _recover_entry(self, dir_name: str) -> Dict[str, Any]:
+        directory = self.backup_directory(dir_name)
+        manifest = self._read_manifest(dir_name)
+        entry = manifest.get("backup")
+        if "backup" in manifest:
+            if not _index_entry_valid(entry) or entry["dir"] != dir_name:
+                raise ValueError("备份目录中的索引记录无效")
+            self._validate_payload(entry)
+            return entry
+
+        # Older manifests contain only items. The directory name carries the
+        # creation time and the layout files carry their own format and keys.
+        stamp = datetime.datetime.strptime(dir_name[7:22], "%Y%m%d_%H%M%S")
+        created = stamp.astimezone().isoformat(timespec="milliseconds")
+        entry = {
+            "id": uuid.uuid5(uuid.NAMESPACE_OID, dir_name.lower()).hex,
+            "dir": dir_name,
+            "created_at": created,
+            "last_used_at": created,
+            "source": "manual",
+            "icon_count": len(manifest["items"]),
+            "reg_files": [],
+        }
+        if (directory / "layout.json").exists():
+            data = self._backup_file(dir_name, "layout.json").read_bytes()
+            decode_layout(json.loads(data))
+            entry["layout_format"] = "shell"
+            entry["payload_hash"] = hashlib.sha256(data).hexdigest()
+        else:
+            entry["reg_files"] = recover_export_index(directory)
+            entry["payload_hash"] = validated_payload_hash(directory, entry["reg_files"])
+        return entry
 
     def _save_index(self, index: Dict[str, Any]) -> None:
         write_json_atomic(self._index_path(), index)
@@ -66,6 +166,31 @@ class BackupStore:
             raise FileNotFoundError(f"备份文件缺失或路径无效: {file_name}")
         return path
 
+    def _read_manifest(self, dir_name: str) -> Dict[str, Any]:
+        with self.manifest_file(dir_name).open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise ValueError("备份清单格式无效")
+        for item in data["items"]:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("name"), str)
+                or ("path" in item and not isinstance(item["path"], str))
+            ):
+                raise ValueError("备份清单的图标记录无效")
+        return data
+
+    def _validate_payload(self, entry: Dict[str, Any]) -> None:
+        digest = entry.get("payload_hash")
+        if not isinstance(digest, str) or not _PAYLOAD_HASH.fullmatch(digest):
+            raise ValueError("备份校验值缺失或无效")
+        if entry.get("layout_format") == "shell":
+            self.read_desktop_layout(entry)
+        else:
+            directory = self.backup_directory(entry["dir"])
+            if validated_payload_hash(directory, entry.get("reg_files")) != digest:
+                raise ValueError("备份注册表文件校验失败")
+
     def read_desktop_layout(self, entry: Dict[str, Any]) -> Layout:
         data = self._backup_file(entry["dir"], "layout.json").read_bytes()
         if hashlib.sha256(data).hexdigest() != entry["payload_hash"]:
@@ -84,25 +209,25 @@ class BackupStore:
                 entry_dir = self.backup_directory(item["dir"])
                 if not entry_dir.is_dir():
                     raise FileNotFoundError("备份目录不存在")
-                self.manifest_file(item["dir"])
-                digest = item.get("payload_hash")
-                if not isinstance(digest, str) or not _PAYLOAD_HASH.fullmatch(digest):
-                    raise ValueError("备份校验值缺失或无效")
-                if item.get("layout_format") == "shell":
-                    self._backup_file(item["dir"], "layout.json")
-                else:
-                    reg_files = item.get("reg_files") or []
-                    if not isinstance(reg_files, list) or not reg_files:
-                        raise FileNotFoundError("注册表文件信息缺失")
-                    for reg_info in reg_files:
-                        if not isinstance(reg_info, dict) or "file" not in reg_info:
-                            raise FileNotFoundError("注册表文件信息不完整")
-                        backup_reg_file(entry_dir, reg_info["file"])
-            except Exception as exc:
+                self._read_manifest(item["dir"])
+                self._validate_payload(item)
+            except _BACKUP_ERRORS as exc:
                 item["broken"] = True
                 item["broken_reason"] = str(exc)
             result.append(item)
         return sorted(result, key=lambda e: e.get("created_at", ""), reverse=True)
+
+    def _matches_latest(self, entry, digest: str, manifest: List[Dict[str, str]]) -> bool:
+        if not entry or entry.get("payload_hash") != digest:
+            return False
+        try:
+            if self._read_manifest(entry["dir"])["items"] != manifest:
+                return False
+            self._validate_payload(entry)
+        except _BACKUP_ERRORS as exc:
+            logger.warning("最新备份未通过校验，继续创建新备份: %s", exc)
+            return False
+        return True
 
     def create_backup(
         self,
@@ -125,7 +250,7 @@ class BackupStore:
             entries = index["backups"]
             pending = self._retry_cleanup(index)
             newest = max(entries, key=lambda e: e.get("created_at", ""), default=None)
-            if newest and newest.get("payload_hash") == digest:
+            if self._matches_latest(newest, digest, manifest):
                 logger.info("布局与最新备份一致，跳过建档")
                 shutil.rmtree(payload_dir, ignore_errors=True)
                 return False, newest, "skip"
@@ -157,7 +282,7 @@ class BackupStore:
                 evicted_dirs.append(victim.get("dir"))
 
             with (payload_dir / "manifest.json").open("w", encoding="utf-8") as fh:
-                json.dump({"items": manifest}, fh, ensure_ascii=False, indent=2)
+                json.dump({"items": manifest, "backup": entry}, fh, ensure_ascii=False, indent=2)
             payload_dir.rename(final_dir)
             try:
                 index["pending_cleanup"] = pending + evicted_dirs
@@ -179,8 +304,15 @@ class BackupStore:
                 continue
             if name.lower() in active:
                 continue
+            marker = self._base / f".{name}.deleted"
             try:
+                try:
+                    with marker.open("xb"):
+                        pass
+                except FileExistsError:
+                    pass
                 self._remove_dir(name)
+                marker.unlink(missing_ok=True)
             except (OSError, ValueError):
                 logger.warning("清理备份目录失败: %s", name, exc_info=True)
                 remaining.append(name)
@@ -227,6 +359,12 @@ class BackupStore:
                 if entry.get("id") == entry_id:
                     entry["last_used_at"] = now_iso()
                     self._save_index(index)
+                    try:
+                        manifest = self._read_manifest(entry["dir"])
+                        manifest["backup"] = entry
+                        write_json_atomic(self.manifest_file(entry["dir"]), manifest)
+                    except _BACKUP_ERRORS:
+                        logger.warning("无法更新备份目录中的最后使用时间", exc_info=True)
                     return entry
         raise KeyError("备份不存在")
 
